@@ -1,0 +1,20 @@
+{
+  "allowlist": [
+    {
+      "source_id": "security-ci:d3af23b14a4a3201ead6ef34",
+      "tool": "semgrep",
+      "rule": "python.jwt.security.jwt-hardcode.jwt-python-hardcoded-secret",
+      "path_contains": "mcp-server/test_token_verifier.py",
+      "owner": "security",
+      "reason": "Negative-control fixture proves HS256 shared-secret tokens are rejected by the RS256/JWKS-only verifier; the literal is not a credential."
+    },
+    {
+      "source_id": "security-ci:e31681f2ad8f83f9c8b0ac43",
+      "tool": "deps",
+      "rule": "pkg:shizuha-labs/notes:npm:ajv",
+      "path_contains": "frontend/package-lock.json",
+      "owner": "security",
+      "reason": "Dev-only transitive dep (ajv 6.15.0 via eslint 8, which pins ajv ^6.12.4). CVE-2025-69873 is a ReDoS only reachable when the $data option is enabled; eslint's config-schema validation does not use $data, so it is not exploitable in this context. No safe ajv 6.x exists (advisory covers through 8.17.1); upgrading eslint to 9 (ajv 8) is a tracked follow-up."
+    }
+  ]
+}

@@ -1,0 +1,214 @@
+# Shizuha Origin CI/CD — MULTI-ARCH build + deploy shizuha-notes-FRONTEND (PLAT-1058).
+# The frontend is a separate image from the backend (deploy.yml builds the backend).
+# Self-contained: @shizuha/ui is resolved from the in-cluster npm-cache (Verdaccio)
+# via the canonical @shizuha/ui/vite boundary (ORIG-231/ORIG-324), so this
+# standalone-repo CI can build it without a /packages monorepo mount.
+# Multi-arch (amd64 s1 + arm64 gx10) — frontend must run on any cluster node.
+name: deploy-shizuha-notes-frontend
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+concurrency:
+  group: deploy-shizuha-notes-frontend-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-and-deploy:
+    # This job only orchestrates in-cluster multi-arch builders. Keep it off
+    # the single general lane, where unrelated long compiles can starve deploys.
+    runs-on: deploy-lane
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
+          case "$KUBECTL_ARCH" in
+            amd64) KUBECTL_SHA256="7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3" ;;
+            arm64) KUBECTL_SHA256="420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450" ;;
+          esac
+          curl --retry 3 --retry-all-errors --retry-delay 1 --max-time 60 -fsSL -o kubectl \
+            "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          echo "${KUBECTL_SHA256}  kubectl" | sha256sum -c -
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Verify concurrent chart update contract
+        run: python3 .forgejo/scripts/test_persist_frontend_tag.py
+      - name: Multi-arch build + deploy + verify (frontend)
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          # Run-unique job suffix: commit-keyed job names collide on reruns — a
+          # prior run's failed Job object persists ("unchanged" on apply) and the
+          # wait instantly sees the stale failure (run 353: kaniko amd64 "build
+          # failed" on a job object from the earlier RED run, with the failure
+          # log dump itself dying on a kubelet-proxy 502). Same pattern as the
+          # deploy repo's run-unique verify jobs.
+          RUNSUFFIX="$(printf '%s' "${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}" | tr -cd 'a-zA-Z0-9-')"
+          FTAG="notes-frontend-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          echo "Multi-arch build shizuha-notes-frontend:${FTAG} (amd64 + arm64)"
+
+          render_build_job() {  # $1=arch
+            local ARCH="$1"
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-build-notes-frontend-${SHORT}-${RUNSUFFIX}-${ARCH}
+            namespace: build
+            labels: { app: ci-build, service: notes-frontend }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 900
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  # s1 carries the operator=unschedulable taint; amd64 needs
+                  # it to land there once i9-ws is excluded (books#76 pattern;
+                  # key pending the exact taint datum — PLAT-7828).
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                        # i9-ws has chronic registry i/o timeouts (dial tcp
+                        # 10.43.94.97:5000 i/o timeout during kaniko push
+                        # checks — run 366); keep amd64 builds off it.
+                        - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/notes.git /workspace/src
+                        cd /workspace/src && (git checkout ${{ github.sha }} 2>/dev/null || echo "sha not in shallow clone; building default HEAD")
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src
+                      - --dockerfile=/workspace/src/frontend/Dockerfile.ci
+                      - --destination=${REG}/shizuha-notes-frontend:${FTAG}-${ARCH}
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      - --build-arg=NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+                      - --build-arg=VITE_BASE_PATH=/notes/
+                      - --build-arg=VITE_API_BASE=/notes/api
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/shizuha-notes-frontend-${ARCH}
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          }
+
+          BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+          BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+          BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+          kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+            -o jsonpath='{.data.guard\.py}' >"$BUILD_GUARD"
+          echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+          job_name_for_arch() {
+            local ARCH="$1"
+            render_build_job "$ARCH" | awk '$1 == "name:" { print $2; exit }'
+          }
+          AMD64_JOB="$(job_name_for_arch amd64)"
+          ARM64_JOB="$(job_name_for_arch arm64)"
+          test -n "$AMD64_JOB" -a -n "$ARM64_JOB"
+          cleanup_build_pair() {
+            python3 "$BUILD_GUARD" cleanup \
+              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+          }
+          cleanup_on_failure() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then cleanup_build_pair || true; fi
+            exit "$rc"
+          }
+          trap cleanup_on_failure EXIT INT TERM
+          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          cleanup_build_pair
+          render_build_job amd64 | kubectl apply -f -
+          render_build_job arm64 | kubectl apply -f -
+          python3 "$BUILD_GUARD" wait-pair --namespace build \
+            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+            --timeout-seconds 1800
+          trap - EXIT INT TERM
+
+          wait_job() {
+            local ARCH="$1"
+            local JOB="ci-build-notes-frontend-${SHORT}-${RUNSUFFIX}-${ARCH}"
+            kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1800s &
+            local WP=$!
+            while kill -0 "$WP" 2>/dev/null; do
+              if kubectl get "job/${JOB}" -n build -o jsonpath='{.status.failed}' | grep -q '[1-9]'; then
+                echo "::error::kaniko frontend ${ARCH} build failed"
+                kubectl logs -n build "job/${JOB}" --all-containers --tail=80 || true
+                exit 1
+              fi
+              sleep 5
+            done
+            wait "$WP"
+          }
+          wait_job amd64
+          wait_job arm64
+
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-manifest-notes-frontend-${SHORT}-${RUNSUFFIX}
+            namespace: build
+            labels: { app: ci-manifest, service: notes-frontend }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 900
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: crane
+                    image: gcr.io/go-containerregistry/crane:latest
+                    args:
+                      - index
+                      - append
+                      - --insecure
+                      - -t
+                      - ${REG}/shizuha-notes-frontend:${FTAG}
+                      - -m
+                      - ${REG}/shizuha-notes-frontend:${FTAG}-amd64
+                      - -m
+                      - ${REG}/shizuha-notes-frontend:${FTAG}-arm64
+          YAML
+          kubectl wait -n build --for=condition=complete "job/ci-manifest-notes-frontend-${SHORT}-${RUNSUFFIX}" --timeout=300s || {
+            echo "::error::frontend manifest combine failed"
+            kubectl logs -n build "job/ci-manifest-notes-frontend-${SHORT}-${RUNSUFFIX}" --tail=80 || true
+            exit 1
+          }
+
+          # Persist before rollout: backend Helm upgrades read this same source.
+          DEPLOY_PUSH_TOKEN="${{ secrets.DEPLOY_PUSH_TOKEN }}" VERIFIED_FRONTEND_TAG="$FTAG" \
+            python3 .forgejo/scripts/persist-frontend-tag.py
+
+          kubectl set image -n shizuha deploy/shizuha-notes-frontend frontend="localhost:30500/shizuha-notes-frontend:${FTAG}"
+          kubectl rollout status -n shizuha deploy/shizuha-notes-frontend --timeout=300s
+
+          LIVE="$(kubectl get deploy -n shizuha shizuha-notes-frontend -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          echo "Live frontend image: ${LIVE}"
+          echo "${LIVE}" | grep -q "${FTAG}" || { echo "::error::frontend image mismatch"; exit 1; }
+          kubectl get pods -n shizuha -l app=shizuha-notes-frontend

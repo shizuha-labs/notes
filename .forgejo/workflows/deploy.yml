@@ -1,0 +1,354 @@
+# Shizuha Origin CI/CD — MULTI-ARCH build + deploy shizuha-notes backend (PLAT-1022 follow-up: notes had no backend deploy.yml).
+# Lives in the notes repo; triggers on its own pushes (synced GitHub->Origin every 5m).
+# Builds shizuha-notes for BOTH amd64 + arm64 via two in-cluster kaniko Jobs (arch-matched nodes),
+# combines them into a multi-arch manifest list with crane, deploys the list, and verifies.
+# Multi-arch = the image runs on any platform node (s1 amd64 OR gx10 arm64) per PLAT-718 —
+# no single-arch regression / exec-format crashes. Auth = KUBE_CONFIG_B64 org secret
+# (least-privilege origin-ci-deployer SA). No submodule checkout, no docker-in-DinD.
+name: deploy-shizuha-notes
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+# NTS-45 / ORIG-80: deploy-lane runner + cancel-in-progress: false at the
+# workflow level so deploys queue serially and always land (ubuntu-latest
+# is starved by long codex cross-compiles — ORIG-71/ORIG-76).
+# The workflow has only this single job, so job-level concurrency is redundant.
+# (The GitHub->Origin pull-sync also collapses rapid commits to one run per cycle.)
+concurrency:
+  group: deploy-shizuha-notes-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build-and-deploy:
+    runs-on: deploy-lane
+    # act falls back to `sh` on the origin-ci-helm image when no run shell is
+    # declared — `set -o pipefail` is illegal there. Every other
+    # origin-ci-helm workflow declares bash explicitly; match them.
+    defaults:
+      run:
+        shell: bash
+    container:
+      # ORIG-102: helm is a supply-chain-pinned part of the helm-ci job image —
+      # the NTS-59 helm-owned deploy step fail-closes without it. Pin the same
+      # digest-pinned origin-ci-helm image the other helm-running lanes use.
+      image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:51c1a6d0ae696139c8ee73154da7bab2e350aba0e7a104974ffa2b34591aeae5
+    steps:
+      - name: Verify CI toolbox + configure cluster access
+        run: |
+          set -euo pipefail
+          # The digest-pinned CI toolbox already contains the verified client.
+          # Downloading it again makes cluster access depend on a 60MB transfer.
+          kubectl version --client=true
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Multi-arch build + deploy + verify
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          TAG="notes-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          NPM_CONFIG_REGISTRY="${NPM_CONFIG_REGISTRY:-http://npm-cache.registry.svc.cluster.local:4873/}"
+          PIP_INDEX_URL="${PIP_INDEX_URL:-http://pip-cache.registry.svc.cluster.local/simple/}"
+          PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pip-cache.registry.svc.cluster.local}"
+          UV_INDEX_URL="${UV_INDEX_URL:-http://pip-cache.registry.svc.cluster.local/simple/}"
+          UV_INSECURE_HOST="${UV_INSECURE_HOST:-pip-cache.registry.svc.cluster.local}"
+          APT_HTTP_PROXY="${APT_HTTP_PROXY:-http://apt-cache.registry.svc.cluster.local:3142}"
+          echo "Multi-arch build shizuha-notes:${TAG} (amd64 + arm64)"
+
+          render_build_job() {  # $1=arch
+            local ARCH="$1"
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-build-shizuha-notes-${SHORT}-${ARCH}
+            namespace: build
+            labels: { app: ci-build, shizuha.io/orig-task: ORIG-7 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 900
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  # s1 carries the operator=unschedulable taint; amd64 needs
+                  # it to land there once i9-ws is excluded (books#76 pattern).
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                        # i9-ws: chronic registry i/o timeouts (kaniko push
+                        # checks); 100.64.0.23: kubelet proxy 502 (run 367,
+                        # log-blind failures). Route amd64 to s1 (books pattern).
+                        - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/notes.git /workspace/src
+                        cd /workspace/src
+                        EXPECTED_SHA="${{ github.sha }}"
+                        if ! git checkout "\${EXPECTED_SHA}" 2>/dev/null; then
+                          echo "sha not in depth=50 clone; deepening and retrying"
+                          git fetch --depth=500 origin "\${EXPECTED_SHA}" || git fetch --unshallow origin
+                          git checkout "\${EXPECTED_SHA}"
+                        fi
+                        ACTUAL_SHA="\$(git rev-parse HEAD)"
+                        if [ "\${ACTUAL_SHA}" != "\${EXPECTED_SHA}" ]; then
+                          echo "::error::checked out \${ACTUAL_SHA}, expected \${EXPECTED_SHA}"
+                          exit 1
+                        fi
+                        if [ -f /workspace/src/Dockerfile ]; then
+                          awk '''
+                            /^FROM[[:space:]]/ {
+                              print
+                              print "ARG NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/"
+                              print "ARG PIP_INDEX_URL=http://pip-cache.registry.svc.cluster.local/simple/"
+                              print "ARG PIP_TRUSTED_HOST=pip-cache.registry.svc.cluster.local"
+                              print "ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}"
+                              print "ENV PIP_INDEX_URL=${PIP_INDEX_URL}"
+                              print "ENV PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}"
+                              next
+                            }
+                            { print }
+                          ''' /workspace/src/Dockerfile > /workspace/src/Dockerfile.cache-wired
+                          mv /workspace/src/Dockerfile.cache-wired /workspace/src/Dockerfile
+                        fi
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src
+                      - --dockerfile=/workspace/src/Dockerfile
+                      - --destination=${REG}/shizuha-notes:${TAG}-${ARCH}
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      - --build-arg=NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+                      - --build-arg=PIP_INDEX_URL=http://pip-cache.registry.svc.cluster.local/simple/
+                      - --build-arg=PIP_TRUSTED_HOST=pip-cache.registry.svc.cluster.local
+                      - --build-arg=UV_INDEX_URL=http://pip-cache.registry.svc.cluster.local/simple/
+                      - --build-arg=UV_INSECURE_HOST=pip-cache.registry.svc.cluster.local
+                      - --build-arg=APT_HTTP_PROXY=http://apt-cache.registry.svc.cluster.local:3142
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/shizuha-notes-${ARCH}
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          }
+
+          # Delete same-SHA leftovers before creating Jobs. A rerun after a
+          # failed/complete Job would otherwise leave `kubectl apply` unchanged
+          # and wait on stale status/logs instead of rebuilding the current SHA.
+          kubectl delete job -n build \
+            "ci-build-shizuha-notes-${SHORT}-amd64" \
+            "ci-build-shizuha-notes-${SHORT}-arm64" \
+            "ci-manifest-shizuha-notes-${SHORT}" \
+            --ignore-not-found
+
+          # Launch both arch builds in parallel
+          BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+          BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+          BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+          kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+            -o jsonpath='{.data.guard\.py}' >"$BUILD_GUARD"
+          echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+          job_name_for_arch() {
+            local ARCH="$1"
+            render_build_job "$ARCH" | awk '$1 == "name:" { print $2; exit }'
+          }
+          AMD64_JOB="$(job_name_for_arch amd64)"
+          ARM64_JOB="$(job_name_for_arch arm64)"
+          test -n "$AMD64_JOB" -a -n "$ARM64_JOB"
+          cleanup_build_pair() {
+            python3 "$BUILD_GUARD" cleanup \
+              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+          }
+          cleanup_on_failure() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then cleanup_build_pair || true; fi
+            exit "$rc"
+          }
+          trap cleanup_on_failure EXIT INT TERM
+          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          cleanup_build_pair
+          render_build_job amd64 | kubectl apply -f -
+          render_build_job arm64 | kubectl apply -f -
+          python3 "$BUILD_GUARD" wait-pair --namespace build \
+            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+            --timeout-seconds 1800
+          trap - EXIT INT TERM
+
+          wait_job() {  # $1=arch
+            local J="ci-build-shizuha-notes-${SHORT}-$1"
+            kubectl wait -n build --for=condition=complete "job/${J}" --timeout=1800s &
+            local WP=$!
+            while kill -0 $WP 2>/dev/null; do
+              if kubectl get "job/${J}" -n build -o jsonpath='{.status.failed}' | grep -q '[1-9]'; then
+                echo "::error::kaniko $1 build failed"; kubectl logs -n build "job/${J}" --all-containers --tail=40 || true; exit 1; fi
+              sleep 5
+            done; wait $WP
+          }
+          # Observe both builds from the moment they start. Waiting serially lets the
+          # faster Job reach its TTL and disappear while the slower build is running.
+          wait_job amd64 &
+          AMD64_WAIT_PID=$!
+          wait_job arm64 &
+          ARM64_WAIT_PID=$!
+          WAIT_FAILED=0
+          wait "${AMD64_WAIT_PID}" || WAIT_FAILED=1
+          wait "${ARM64_WAIT_PID}" || WAIT_FAILED=1
+          if [ "${WAIT_FAILED}" -ne 0 ]; then
+            echo "::error::one or more architecture builds failed"
+            exit 1
+          fi
+          echo "Both arch builds done."
+
+          # Combine into a multi-arch manifest list with crane
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-manifest-shizuha-notes-${SHORT}
+            namespace: build
+            labels: { app: ci-manifest, shizuha.io/orig-task: ORIG-7 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 900
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: crane
+                    image: gcr.io/go-containerregistry/crane:v0.20.3
+                    # Image entrypoint IS the crane binary (distroless, no shell) — pass args directly.
+                    args:
+                      - index
+                      - append
+                      - --insecure
+                      - -t
+                      - ${REG}/shizuha-notes:${TAG}
+                      - -m
+                      - ${REG}/shizuha-notes:${TAG}-amd64
+                      - -m
+                      - ${REG}/shizuha-notes:${TAG}-arm64
+          YAML
+          kubectl wait -n build --for=condition=complete "job/ci-manifest-shizuha-notes-${SHORT}" --timeout=300s || {
+            echo "::error::manifest combine failed"; kubectl logs -n build "job/ci-manifest-shizuha-notes-${SHORT}" --tail=30 || true; exit 1; }
+
+          # Deploy the multi-arch manifest list — NTS-59: via the helm-owned
+          # release, not a direct `kubectl set image`. The direct path left the
+          # shizuha-notes helm release stale (rev 13 @ 07-02, stored tag
+          # notes-18e94d8 vs live notes-6021710), so the PLS-675 deploy-verify
+          # gate's helm-advance proof was mechanically unsatisfiable and merged
+          # fixes sat in awaiting_deploy. The helm upgrade IS the deployment
+          # transaction; the values.yaml auto-update below keeps the deploy
+          # repo's chart values in sync with what helm actually deployed.
+          DEPLOY_DIR="$(mktemp -d)"
+          git clone --quiet --depth 1 "http://oauth2:${{ secrets.DEPLOY_PUSH_TOKEN }}@forgejo-http.origin.svc.cluster.local/shizuha-labs/deploy.git" "$DEPLOY_DIR/deploy"
+          bash "$DEPLOY_DIR/deploy/.forgejo/scripts/install-helm.sh"
+          # Chart.yaml declares a file://../shizuha-common dependency — vendor it
+          # into charts/ before upgrade (same convention as every other
+          # helm-upgrade lane; --skip-refresh keeps resolution local, no WAN).
+          helm dependency build --skip-refresh "$DEPLOY_DIR/deploy/k3s/charts/shizuha-notes"
+          # NTS-59: helm status "version" is the RELEASE REVISION (integer); helm get metadata "version" is the chart semver (0.1.0 forever) and fails the advance proof (run 446).
+          HELM_BEFORE="$(helm status shizuha-notes -n shizuha -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version") or 0)' || echo 0)"
+          helm upgrade --install shizuha-notes "$DEPLOY_DIR/deploy/k3s/charts/shizuha-notes" \
+            -n shizuha --set "image.tag=${TAG}"
+          kubectl rollout status -n shizuha deploy/shizuha-notes --timeout=300s
+          LIVE="$(kubectl get deploy -n shizuha shizuha-notes -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          echo "Live: ${LIVE}"; echo "${LIVE}" | grep -q "${TAG}" && echo "OK multi-arch ${TAG}" || { echo "::error::image mismatch"; exit 1; }
+
+          # NTS-58 AC4: a rolled-out image does NOT mean the schema moved.
+          # supervisord runs `migrate` with exitcodes=0,1, so a HARD migration
+          # failure is logged as "exited: migrate (exit status 1; expected)"
+          # and the traceback goes to an unredirected stderr. On 2026-07-18 a
+          # renumbered migration (0006_rename_… -> 0011) re-attempted a rename
+          # that had already been applied under its old NAME; it aborted, so
+          # dependent 0012 never created notes_owned_object_share, and every
+          # surface joining that table 500'd for four days while this deploy
+          # step went green on the image check alone.
+          #
+          # `migrate --check` exits non-zero when ANY migration is unapplied,
+          # so it turns that silent divergence into a red deploy. A view-level
+          # test cannot catch this: it runs against a correctly-migrated test
+          # DB and passes while production is broken.
+          # Address the Deployment, not a guessed label selector: this workflow
+          # already proves `deploy/shizuha-notes` + container `shizuha-notes`
+          # are correct at the `kubectl set image` line above, whereas the
+          # frontend workflow uses a different label scheme (`app=`), so a
+          # selector copied from either could silently match nothing.
+          #
+          # NTS-67: the gate logic lives in scripts/migration-gate.sh (shared
+          # with the isolated red-path test) and its failure diagnostic is
+          # PROJECT-WIDE (`showmigrations` + `migrate --plan`), because
+          # `migrate --check` checks every app while the old diagnostic only
+          # showed `notes` — a non-notes unapplied migration pointed nowhere.
+          if ! kubectl exec -n shizuha deploy/shizuha-notes -c shizuha-notes -- \
+                 bash /app/scripts/migration-gate.sh; then
+            exit 1
+          fi
+          echo "OK schema converged — no unapplied migrations"
+
+          # NTS-59: record the correlated production DeploymentEvent (PLS-675
+          # deploy-verify close gate). The helm-advance proof (before/after
+          # revision) is the ledger's identity anchor; the digest comes from
+          # the live pod's imageID (immutable sha256). Recording failure is a
+          # warning — the rollout itself already succeeded.
+          # NTS-59: same revision semantics as HELM_BEFORE above.
+          HELM_AFTER="$(helm status shizuha-notes -n shizuha -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version") or 0)' || echo 0)"
+          RAW_IMAGE_ID="$(kubectl get deploy -n shizuha shizuha-notes -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          LIVE_DIGEST=""
+          for attempt in 1 2 3 4 5; do
+            RAW_IMAGE_ID="$(kubectl get pod -n shizuha -l app.kubernetes.io/name=shizuha-notes -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null || true)"
+            if [[ "$RAW_IMAGE_ID" =~ (sha256:[0-9a-f]{64}) ]]; then
+              LIVE_DIGEST="${BASH_REMATCH[1]}"
+              break
+            fi
+            echo "notes pod imageID unresolved (attempt ${attempt}, retrying)" >&2
+            sleep 5
+          done
+          if [[ "$LIVE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            if ! DEPLOYMENT_EVENT_IMAGE_DIGEST="$LIVE_DIGEST" \
+                DEPLOYMENT_EVENT_HELM_BEFORE="$HELM_BEFORE" \
+                DEPLOYMENT_EVENT_HELM_AFTER="$HELM_AFTER" \
+                "$DEPLOY_DIR/deploy/.forgejo/scripts/record-deployment-event.sh" \
+                NTS shizuha shizuha-notes backend shizuha-notes "localhost:30500/shizuha-notes:${TAG}"; then
+              echo "::warning::notes rollout succeeded but DeploymentEvent recording failed" >&2
+            fi
+          else
+            echo "::warning::could not resolve an immutable image digest from the live notes pod; DeploymentEvent not recorded" >&2
+          fi
+
+          # Auto-update values.yaml in deploy repo so helm upgrade never reverts the tag (PLAT-1043)
+          FGJO_IP="$(kubectl get svc forgejo-http -n origin -o jsonpath='{.spec.clusterIP}')"
+          FGJO_URL="http://${FGJO_IP}:80"
+          VALS_PATH="k3s%2Fcharts%2Fshizuha-notes%2Fvalues.yaml"
+          RESP="$(curl -sf -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+            "${FGJO_URL}/api/v1/repos/shizuha-labs/deploy/contents/${VALS_PATH}")"
+          FILE_SHA="$(echo "${RESP}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["sha"])')"
+          CURRENT_CONTENT="$(echo "${RESP}" | python3 -c 'import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)["content"]).decode())')"
+          NEW_CONTENT="$(echo "${CURRENT_CONTENT}" | sed "s|^  tag: .*|  tag: ${TAG}|")"
+          NEW_B64="$(echo "${NEW_CONTENT}" | base64 -w0)"
+          BODY="$(python3 -c "import json,sys; print(json.dumps({'message':'ci(shizuha-notes): auto-update image tag to ${TAG} [ci skip]','content':sys.argv[1],'sha':'${FILE_SHA}','committer':{'email':'ci@shizuha.com','name':'Origin CI'}}))" "${NEW_B64}")"
+          curl -sf -X PUT -H "Authorization: token ${{ secrets.DEPLOY_PUSH_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${FGJO_URL}/api/v1/repos/shizuha-labs/deploy/contents/${VALS_PATH}" \
+            -d "${BODY}" > /dev/null \
+            && echo "values.yaml updated to ${TAG}" \
+            || echo "WARNING: values.yaml update failed (non-blocking — deploy already live)"

@@ -1,0 +1,147 @@
+# NTS-36 (PLAT-1236 authz-invariant pattern): cross-user / cross-org data-isolation
+# gate. Runs the object-level IDOR negative suite proving User A cannot read/edit/
+# delete/share/duplicate/restore/comment/bulk-touch User B's notes (or B's
+# notebook/tag) across the org boundary without an explicit share grant.
+#
+# Separate workflow on purpose (mirrors migration-drift gates): an authz-test
+# failure is a hard security signal that must surface on every PR/push, decoupled
+# from deploy.yml's build/rollout path. Self-contained settings (sqlite, no
+# Postgres/Redis/JWT) via notes.tests.authz_ci_settings.
+name: authz-invariant-check
+on:
+  workflow_dispatch: {}
+  pull_request: {}
+  push:
+    branches: [main, master]
+concurrency:
+  group: authz-invariant-check-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  authz-invariant:
+    # NTS-45 / ORIG-76: keep this short main-branch security gate off the shared
+    # ubuntu-latest lane while codex cross-compile jobs can starve it for hours.
+    # deploy-lane is already live (ORIG-76/ORIG-80).
+    runs-on: deploy-lane
+    # Debian Bookworm provides the real PG15 historical-migration test engine.
+    container:
+      image: docker.io/library/python@sha256:581429e3df12d76e6af4be5ab7d0e7fc2013eb57dc23d2de691411c8efdbb970
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Bootstrap hash-pinned checkout Node
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import hashlib
+          import io
+          import os
+          import platform
+          import subprocess
+          import tarfile
+          import urllib.request
+
+          artifacts = {
+              'x86_64': ('x64', '69b09dba5c8dcb05c4e4273a4340db1005abeafe3927efda2bc5b249e80437ec'),
+              'aarch64': ('arm64', '08bfbf538bad0e8cbb0269f0173cca28d705874a67a22f60b57d99dc99e30050'),
+          }
+          if platform.machine() not in artifacts:
+              raise SystemExit('Unsupported checkout Node architecture')
+          arch, expected_sha = artifacts[platform.machine()]
+          filename = f'node-v22.14.0-linux-{arch}'
+          url = f'http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/node/v22.14.0/{filename}.tar.xz'
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  raise ValueError('Checkout Node artifact redirect refused')
+
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+          with opener.open(url, timeout=30) as response:
+              body = response.read(80 * 1024 * 1024 + 1)
+          if len(body) > 80 * 1024 * 1024 or hashlib.sha256(body).hexdigest() != expected_sha:
+              raise SystemExit('Checkout Node artifact digest mismatch')
+          with tarfile.open(fileobj=io.BytesIO(body), mode='r:xz') as archive:
+              member = archive.getmember(f'{filename}/bin/node')
+              if not member.isfile():
+                  raise SystemExit('Checkout Node executable must be a regular file')
+              binary = archive.extractfile(member).read()
+          # Only the hash-verified executable is installed in the ephemeral job container;
+          # no archive paths, symlinks, package scripts, or host runtime are extracted.
+          with open('/usr/local/bin/node', 'wb') as output:
+              output.write(binary)
+          os.chmod('/usr/local/bin/node', 0o755)
+          assert subprocess.check_output(['node', '--version'], text=True).strip() == 'v22.14.0'
+          subprocess.run(['git', '--version'], check=True)
+          PYTHON
+      - uses: actions/checkout@v4
+      - name: cross-user / cross-org authz invariants
+        run: |
+          set -euo pipefail
+          command -v python3 >/dev/null || {
+            apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 update -qq
+            apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 install -y -qq python3 python3-venv
+          }
+          python3 -m venv .venv
+          PIP_INDEX_URL="${PIP_INDEX_URL:-http://pip-cache.registry.svc.cluster.local/simple/}"
+          PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pip-cache.registry.svc.cluster.local}"
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n+1))
+              if [ "$n" -ge 3 ]; then echo "FAILED after 3 attempts: $*" >&2; return 1; fi
+              echo "attempt $n failed, retrying in $((n*10))s: $*" >&2
+              sleep $((n*10))
+            done
+          }
+          retry .venv/bin/pip install --quiet --upgrade pip \
+            --index-url "$PIP_INDEX_URL" --trusted-host "$PIP_TRUSTED_HOST"
+          retry .venv/bin/pip install --quiet uv==0.11.26 \
+            --index-url "$PIP_INDEX_URL" --trusted-host "$PIP_TRUSTED_HOST"
+          # Preserve the registry identity committed in uv.lock. The native runner
+          # injects mirror variables; those change the lock's sources, not its dependencies.
+          env -u UV_DEFAULT_INDEX -u UV_INDEX_URL -u UV_INSECURE_HOST UV_PROJECT_ENVIRONMENT=.venv .venv/bin/uv sync --locked --no-dev --no-install-project
+          DJANGO_SETTINGS_MODULE=notes.tests.authz_ci_settings \
+            .venv/bin/python manage.py test \
+              notes.tests.test_nts36_authz_invariants \
+              notes.tests.test_nts51_owned_object_acl \
+              notes.tests.test_nts59_federated_refresh \
+              notes.tests.test_nts82_tag_query \
+              notes.tests.test_required_signing_key \
+              notes.tests.test_required_credential_configuration \
+              notes.tests.test_authz_dependency_environment \
+              notes.tests.test_native_ci_environment \
+              notes.tests.test_image_bytecode_configuration \
+              notes.tests.test_entrypoint_bootstrap notes.tests.test_attachment_delivery \
+              -v2
+      - name: Migration-gate red path (NTS-67)
+        run: |
+          set -euo pipefail
+          # NTS-67: prove the deploy migration gate's FAILURE path executes the
+          # SAME scripts/migration-gate.sh that deploy.yml runs, against an
+          # isolated temp Django project with a NON-NOTES app's unapplied
+          # migration. Isolated + read-only: sqlite temp dir, no production
+          # schema touched. Also asserts the project-wide diagnostic names the
+          # non-notes culprit (the old `showmigrations notes` could not).
+          NTS67_PYTHON_BIN="$(pwd)/.venv/bin/python" \
+            .venv/bin/python -m unittest notes.tests.test_nts67_migration_gate -v
+
+      - name: Complete native PostgreSQL regressions
+        run: |
+          set -euo pipefail
+          # This restoration guard must exercise real historical PostgreSQL rows.
+          apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 update -qq
+          apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 install -y -qq postgresql-15 redis-server
+          pg_ctlcluster 15 main start
+          pg_isready -h 127.0.0.1 -p 5432
+          test "$(su postgres -c 'psql -Atqc "SHOW server_version_num"')" -ge 150000
+          test "$(su postgres -c 'psql -Atqc "SHOW server_version_num"')" -lt 160000
+          redis-server --daemonize yes
+          export CELERY_BROKER_URL=redis://127.0.0.1:6379/4 CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/4
+          export POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 POSTGRES_USER=postgres POSTGRES_DB=notes_migration_ci
+          export POSTGRES_PASSWORD="$(.venv/bin/python -c 'import secrets; print(secrets.token_hex(24))')"
+          export SECRET_KEY="$(.venv/bin/python -c 'import secrets; print(secrets.token_hex(24))')"
+          su postgres -c "psql -v ON_ERROR_STOP=1 -c \"ALTER USER postgres PASSWORD '$POSTGRES_PASSWORD';\""
+          su postgres -c "createdb notes_migration_ci"
+          .venv/bin/python manage.py check
+          .venv/bin/python manage.py makemigrations --check --dry-run
+          .venv/bin/python manage.py test --noinput
