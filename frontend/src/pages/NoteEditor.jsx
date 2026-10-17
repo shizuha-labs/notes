@@ -10,6 +10,7 @@ import { notesApi, attachmentsApi } from '../services/api'
 import { resolveNoteEditorContent } from '../utils/noteContent'
 import { useWorkspace } from '../contexts/WorkspaceContext'
 import RichTextEditor from '../components/RichTextEditor'
+import { AttachmentLink, AttachmentThumbnail } from '../components/AttachmentFile'
 import LoadingSpinner from '../components/LoadingSpinner'
 import { cn } from '../utils/cn'
 import { formatDistanceToNow } from 'date-fns'
@@ -603,7 +604,7 @@ export default function NoteEditor() {
                 <div className="flex-shrink-0">
                   {attachment.file_type === 'image' ? (
                     <div className="w-10 h-10 rounded overflow-hidden bg-gray-200 dark:bg-gray-700">
-                      <img
+                      <AttachmentThumbnail
                         src={attachment.file_url || attachment.file}
                         alt={attachment.original_filename}
                         className="w-full h-full object-cover"
@@ -632,23 +633,24 @@ export default function NoteEditor() {
 
                 {/* Actions */}
                 <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <a
-                    href={attachment.file_url || attachment.file}
-                    target="_blank"
-                    rel="noopener noreferrer"
+                  <AttachmentLink
+                    src={attachment.file_url || attachment.file}
+                    filename={attachment.original_filename}
+                    action="open"
                     className="p-1.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"
                     title="Open in new tab"
                   >
                     <ExternalLink className="h-4 w-4" />
-                  </a>
-                  <a
-                    href={attachment.file_url || attachment.file}
-                    download={attachment.original_filename}
+                  </AttachmentLink>
+                  <AttachmentLink
+                    src={attachment.file_url || attachment.file}
+                    filename={attachment.original_filename}
+                    action="download"
                     className="p-1.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"
                     title="Download"
                   >
                     <Download className="h-4 w-4" />
-                  </a>
+                  </AttachmentLink>
                   <button
                     onClick={() => {
                       if (window.confirm(`Delete "${attachment.original_filename}"?`)) {
