@@ -66,4 +66,11 @@ class TagPersistenceTests(unittest.TestCase):
                 module.update_tag('frontend:\n    tag: old\n', tag)
 
 
+# The native frontend owner must also exercise both real image-publication callers.
+event_spec = importlib.util.spec_from_file_location('notes_deploy_event_tests',
+    Path(__file__).resolve().parents[2] / 'notes/tests/test_deploy_owner_event_delivery.py')
+event_module = importlib.util.module_from_spec(event_spec)
+event_spec.loader.exec_module(event_module)
+DeployOwnerEventDeliveryTests = event_module.DeployOwnerEventDeliveryTests
+
 if __name__ == '__main__': unittest.main()

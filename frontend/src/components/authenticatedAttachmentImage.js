@@ -12,6 +12,21 @@ export function attachmentRequestPath(src, baseURL, origin) {
   } catch { return null }
 }
 
+// Every private-file consumer uses the same strict route and redirect boundary.
+export function requestAttachmentBlob(api, src, signal) {
+  const path = attachmentRequestPath(src, api.defaults.baseURL, window.location.origin)
+  if (!path) return Promise.reject(new Error('Unsupported private attachment URL'))
+  return api.get(path, {
+    responseType: 'blob', signal,
+    adapter: 'fetch', fetchOptions: { redirect: 'error' },
+  })
+}
+
+export function attachmentPreviewAllowed(type) {
+  // Opening active HTML/SVG in a same-origin Blob tab would grant script access.
+  return /^(image\/(png|jpeg|gif|webp|avif|bmp|x-icon)|application\/pdf|text\/plain)$/i.test(type.split(';')[0].trim())
+}
+
 export function authenticatedAttachmentImage(extension, api, identity) {
   return extension.extend({
     addNodeView() {
@@ -30,10 +45,7 @@ export function authenticatedAttachmentImage(extension, api, identity) {
         } else {
           image.dataset.canonicalSrc = src
           const requestedIdentity = identity()
-          api.get(path, {
-            responseType: 'blob', signal: controller.signal,
-            adapter: 'fetch', fetchOptions: { redirect: 'error' },
-          }).then(({ data }) => {
+          requestAttachmentBlob(api, src, controller.signal).then(({ data }) => {
             if (destroyed || identity() !== requestedIdentity || !data.type.startsWith('image/')) return
             objectURL = URL.createObjectURL(data)
             image.src = objectURL

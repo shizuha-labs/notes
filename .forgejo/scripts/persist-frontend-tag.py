@@ -45,7 +45,7 @@ def main():
             print('Verified frontend tag already persisted')
             return
         body = {'sha': current['sha'], 'content': base64.b64encode(updated.encode()).decode(),
-                'message': 'ci(notes): preserve verified frontend image in Helm values [ci skip]'}
+                'message': 'ci(notes): preserve verified frontend image in Helm values'}
         try:
             with urlopen(Request(endpoint, headers=headers, data=json.dumps(body).encode(), method='PUT'), timeout=30):
                 pass
