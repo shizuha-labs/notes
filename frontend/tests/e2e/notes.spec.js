@@ -891,7 +891,7 @@ test.describe('Notes App E2E Tests', () => {
       await authenticatedPage.waitForTimeout(1000)
 
       // Verify an image with the correct src was added to the editor
-      const image = authenticatedPage.locator(`.ProseMirror img[src="${imageUrl}"]`)
+      const image = authenticatedPage.locator(`.ProseMirror img[data-canonical-src="${imageUrl}"]`)
       await expect(image).toBeVisible()
       await expect.poll(() => image.evaluate(element => element.naturalWidth)).toBe(2)
       await authenticatedApi.delete(`${BASE_PATH}/api/notes/${note.id}/`)

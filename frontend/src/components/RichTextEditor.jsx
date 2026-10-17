@@ -1,9 +1,11 @@
-import { useMemo } from 'react'
+import { useContext, useMemo } from 'react'
 import {
   BaseEditor,
   createNotesExtensions,
 } from '@shizuha/editor'
-import { attachmentsApi } from '../services/api'
+import api, { attachmentsApi } from '../services/api'
+import AuthContext from '../contexts/AuthContext'
+import { authenticatedAttachmentImage } from './authenticatedAttachmentImage'
 
 /**
  * Rich text editor for Notes using the shared editor package
@@ -19,10 +21,20 @@ export default function RichTextEditor({
   onEnsureSaved,
   onAttachmentUploaded,
 }) {
+  const auth = useContext(AuthContext)
+  const principalId = auth?.user?.id ?? null
+  const identity = JSON.stringify([principalId, auth?.organization?.id ?? null])
+
   // Create extensions with the Notes preset
   const extensions = useMemo(
-    () => createNotesExtensions({ placeholder }),
-    [placeholder]
+    () => createNotesExtensions({ placeholder }).map(extension =>
+      extension.name === 'image' ? authenticatedAttachmentImage(extension, api, () => JSON.stringify([
+        principalId,
+        localStorage.getItem('shizuha_organization_id'),
+        Boolean(localStorage.getItem('shizuha_access_token')),
+      ])) : extension
+    ),
+    [placeholder, principalId]
   )
 
   // Handler for uploading images
@@ -50,6 +62,7 @@ export default function RichTextEditor({
 
   return (
     <BaseEditor
+      key={identity}
       content={content}
       onChange={onChange}
       onBlur={onBlur}
