@@ -476,7 +476,12 @@ class NoteViewSet(viewsets.ModelViewSet):
         # belong on SearchView only — exposing them here would be an undocumented
         # CRUD API expansion with no permission re-check (reviewer P1-1).
         status_param = params.get('status')
-        if status_param:
+        # PLAT-11915: the SPA and QA call GET /notes/?trash=true. Ignoring the
+        # flag listed active notes and then excluded the trashed ones.
+        trash_flag = (params.get('trash') or '').strip().lower()
+        if trash_flag in ('1', 'true', 'yes'):
+            queryset = queryset.filter(status='trashed')
+        elif status_param:
             queryset = queryset.filter(status=status_param)
         else:
             queryset = queryset.exclude(status='trashed')
@@ -746,23 +751,33 @@ class NoteViewSet(viewsets.ModelViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    def _authorized_note(self, request, pk):
+        """Lookup that includes trashed notes. get_queryset hides them."""
+        try:
+            note = build_authorized_queryset(request).get(pk=pk)
+        except Note.DoesNotExist:
+            raise NotFound({'detail': 'No Note matches the given query.'})
+        self.check_object_permissions(request, note)
+        return note
+
     @action(detail=True, methods=['post'])
     def trash(self, request, pk=None):
         """Move note to trash."""
-        note = self.get_object()
+        note = self._authorized_note(request, pk)
         note.trash()
         return Response({'status': 'trashed'})
 
     @action(detail=True, methods=['post'])
     def restore(self, request, pk=None):
         """Restore note from trash."""
-        try:
-            note = build_authorized_queryset(request).get(pk=pk)
-        except Note.DoesNotExist:
-            raise NotFound({'detail': 'No Note matches the given query.'})
-        self.check_object_permissions(request, note)
+        note = self._authorized_note(request, pk)
         note.restore()
         return Response({'status': 'restored'})
+
+    def retrieve(self, request, *args, **kwargs):
+        # A trashed note must stay readable by id so Trash can restore it.
+        note = self._authorized_note(request, kwargs.get('pk'))
+        return Response(self.get_serializer(note).data)
 
     @action(detail=True, methods=['post'])
     def pin(self, request, pk=None):
