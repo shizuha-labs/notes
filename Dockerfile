@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 ARG APT_HTTP_PROXY=""
 ARG UV_INDEX_URL=""
