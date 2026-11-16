@@ -1,0 +1,155 @@
+# PLAT-12387: PR-time regression gate for the Notes Django backend.
+#
+# Gap this closes: notes previously had NO PR-time test lane at all (only the
+# authz-invariant subset and sast-sca). A pull_request touching backend code
+# could merge with the full suite (incl. NTS/PLAT regression tests) never
+# executed — deploy-time rollout verification then ran on a main that had
+# already absorbed untested PRs.
+#
+# Shape: the same in-cluster test Job pattern as shizuha-labs/scs
+# premerge-backend.yml (PLAT-9200) — Postgres + Redis in the Job pod,
+# `makemigrations --check` + full `manage.py test`, pinned to the exact PR
+# head SHA (fails closed unless canonical Origin serves that SHA). Same-repo
+# PRs only — fork PRs lack KUBE_CONFIG_B64 by design; the
+# privileged-merge-gate owns that boundary.
+name: premerge
+
+on:
+  pull_request:
+    paths:
+      - 'manage.py'
+      - 'notes/**'
+      - 'notesmanager/**'
+      - 'mcp-server/**'
+      - 'packages/**'
+      - 'scripts/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'Dockerfile'
+      - 'docker-entrypoint.sh'
+      - 'supervisord.conf'
+      - '.forgejo/workflows/premerge.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: premerge-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Backend test suite (premerge gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
+          case "$KUBECTL_ARCH" in
+            amd64) KUBECTL_SHA256="7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3" ;;
+            arm64) KUBECTL_SHA256="420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450" ;;
+          esac
+          curl --retry 3 --retry-all-errors --retry-delay 1 --max-time 60 -fsSL \
+            -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          echo "${KUBECTL_SHA256}  kubectl" | sha256sum -c -
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Run backend full test suite on the PR head
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          JOB="ci-test-shizuha-notes-premerge-${SHORT}"
+
+          # A rerun of the same exact SHA must replace, not collide with, its
+          # previous Job. The checkout below fails closed unless canonical
+          # Origin serves the exact Forgejo event SHA.
+          kubectl delete job -n build "${JOB}" --ignore-not-found --wait=true
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-test, service: shizuha-notes, shizuha.io/ci-lane: premerge }
+          spec:
+            backoffLimit: 2
+            activeDeadlineSeconds: 1800
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -eu
+                        git clone --no-checkout --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/notes.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=1 origin ${{ github.sha }}
+                        git checkout --detach ${{ github.sha }}
+                        test "\$(git rev-parse HEAD)" = "${{ github.sha }}"
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: test
+                    image: python:3.12-bookworm
+                    command: ["/bin/bash","-lc"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        export DEBIAN_FRONTEND=noninteractive
+                        APT_CACHE='Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142'
+                        apt-get -o "\${APT_CACHE}" update
+                        apt-get -o "\${APT_CACHE}" install -y --no-install-recommends postgresql redis-server build-essential libpq-dev libmagic1 libjpeg-dev zlib1g-dev
+                        pg_ctlcluster 15 main start
+                        su postgres -c "psql -c \"ALTER USER postgres PASSWORD 'postgres';\""
+                        su postgres -c "createdb shizuha_notes_ci" || true
+                        redis-server --daemonize yes
+                        cd /workspace/src
+                        python -m pip install --upgrade pip
+                        python -m pip install uv==0.11.26
+                        uv sync --locked --no-install-project --no-editable
+                        export PATH="/workspace/src/.venv/bin:\$PATH"
+                        export POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_DB=shizuha_notes_ci
+                        export CELERY_BROKER_URL=redis://127.0.0.1:6379/4 CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/4
+                        export DEBUG=True SECRET_KEY=ci-secret JWT_SECRET_KEY=ci-secret SHIZUHA_JWT_SIGNING_KEY=ci-secret
+                        python manage.py makemigrations --check --dry-run
+                        python manage.py test --noinput
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+
+          # Wait for success, but watch the Job's terminal Failed condition in
+          # parallel. A nonzero .status.failed count is not terminal while
+          # backoff retries remain, so failing on that counter would defeat the
+          # configured retry policy. (Identical wait logic to scs premerge.)
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1900s &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            FAILED_COND="$(kubectl get -n build "job/${JOB}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+            if [ "$FAILED_COND" = "True" ]; then
+              echo "::error::Notes premerge backend test gate failed (terminal Failed condition)"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+              kill "$WP" 2>/dev/null || true
+              wait "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          wait "$WP" || {
+            FAILED_COND="$(kubectl get -n build "job/${JOB}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+            if [ "$FAILED_COND" = "True" ]; then
+              echo "::error::Notes premerge backend test gate failed (terminal Failed condition)"
+            else
+              echo "::error::Notes premerge backend test gate failed (timeout without Complete condition)"
+            fi
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+            exit 1
+          }
+          echo "::notice::Notes premerge backend test gate passed for ${{ github.sha }}"
